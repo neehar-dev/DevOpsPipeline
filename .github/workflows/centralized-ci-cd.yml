@@ -1,0 +1,141 @@
+name: Centralized CI/CD Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: 'Pipeline component to run (infra, build, scan, deploy)'
+        required: true
+        type: string
+      language:
+        description: 'Application language for build (dotnet, java, python, node)'
+        required: false
+        type: string
+      terraform_version:
+        description: 'Terraform version to install'
+        required: false
+        type: string
+      terraform_dir:
+        description: 'Path to Terraform code'
+        required: false
+        type: string
+
+jobs:
+  provision_infra:
+    if: ${{ inputs.component == 'infra' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+      - name: Install Ansible
+        run: sudo apt-get update && sudo apt-get install -y ansible ansible-lint
+      - name: Terraform fmt
+        run: terraform -chdir=${{ inputs.terraform_dir || '.' }} fmt -check
+      - name: Terraform init
+        run: terraform -chdir=${{ inputs.terraform_dir || '.' }} init
+      - name: Terraform validate
+        run: terraform -chdir=${{ inputs.terraform_dir || '.' }} validate
+      - name: Ansible lint
+        run: |
+          if ls *.yml >/dev/null 2>&1; then
+            ansible-lint
+          else
+            echo "No Ansible playbooks found"
+          fi
+      - name: Terraform apply
+        run: terraform -chdir=${{ inputs.terraform_dir || '.' }} apply -auto-approve
+
+  build:
+    if: ${{ inputs.component == 'build' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up language
+        run: |
+          case "${{ inputs.language }}" in
+            dotnet)
+              echo "##[group]Setup .NET"
+              sudo apt-get update && sudo apt-get install -y dotnet-sdk-7.0
+              echo "##[endgroup]"
+              dotnet format --verify-no-changes
+              dotnet build --no-restore
+              dotnet test --no-build
+              ;;
+            java)
+              echo "##[group]Setup Java"
+              sudo apt-get update && sudo apt-get install -y maven
+              echo "##[endgroup]"
+              mvn -B package
+              mvn -B test
+              ;;
+            python)
+              echo "##[group]Setup Python"
+              sudo apt-get update && sudo apt-get install -y python3 python3-pip
+              echo "##[endgroup]"
+              python3 -m pip install -r requirements.txt
+              pip3 install flake8 pytest
+              flake8 .
+              pytest
+              python3 setup.py sdist
+              ;;
+            node)
+              echo "##[group]Setup Node"
+              sudo apt-get update && sudo apt-get install -y nodejs npm
+              echo "##[endgroup]"
+              npm ci
+              npm run lint --if-present
+              npm test --if-present
+              npm run build --if-present
+              ;;
+            *)
+              echo "Unknown language"
+              exit 1
+              ;;
+          esac
+
+  scan:
+    if: ${{ inputs.component == 'scan' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - id: lang
+        run: |
+          case "${{ inputs.language }}" in
+            dotnet) echo "ql=csharp" >> "$GITHUB_OUTPUT" ;;
+            java) echo "ql=java" >> "$GITHUB_OUTPUT" ;;
+            python) echo "ql=python" >> "$GITHUB_OUTPUT" ;;
+            node) echo "ql=javascript" >> "$GITHUB_OUTPUT" ;;
+            *) echo "ql=javascript" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ steps.lang.outputs.ql }}
+      - uses: github/codeql-action/analyze@v3
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@v0.14.0
+        with:
+          scan-type: fs
+          scan-ref: .
+
+  deploy_stage:
+    if: ${{ inputs.component == 'deploy' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Deploy to stage
+        run: echo "Deploying to stage environment"
+      - name: Run stage tests
+        run: echo "Running tests in stage"
+
+  deploy_prod:
+    if: ${{ inputs.component == 'deploy' }}
+    needs: deploy_stage
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v3
+      - name: Deploy to production
+        run: echo "Deploying to production environment"
